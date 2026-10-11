@@ -150,6 +150,13 @@ extension SSHMessage {
 
         enum PublicKeyAuthType: Equatable {
             case known(key: NIOSSHPublicKey, signature: NIOSSHSignature?)
+            // RFC 8332: an ssh-rsa key used with a SHA-2 signature algorithm. The SHA-1 `ssh-rsa` algorithm
+            // name is not supported and parses as `unknown`.
+            case rsaSHA2(
+                key: NIOSSHPublicKey,
+                algorithm: NIOSSHPrivateKey.RSASignatureAlgorithm,
+                signature: NIOSSHSignature?
+            )
             case unknown
         }
 
@@ -687,8 +694,35 @@ extension ByteBuffer {
                     return nil
                 }
 
-                if NIOSSHPublicKey.knownAlgorithms.contains(where: { $0.elementsEqual(algorithmName.readableBytesView) }
+                if let rsaAlgorithm = NIOSSHPrivateKey.RSASignatureAlgorithm(
+                    wireName: algorithmName.readableBytesView
                 ) {
+                    guard let publicKey = try keyBytes.readSSHHostKey() else {
+                        return nil
+                    }
+                    guard case .rsa = publicKey.backingKey else {
+                        throw NIOSSHError.invalidSSHMessage(reason: "algorithm and key mismatch in user auth request")
+                    }
+
+                    if expectSignature {
+                        guard var signatureBytes = self.readSSHString(),
+                            let signature = try signatureBytes.readSSHSignature()
+                        else {
+                            return nil
+                        }
+                        guard case .rsa(rsaAlgorithm, _) = signature.backingSignature else {
+                            throw NIOSSHError.invalidSSHMessage(
+                                reason: "signature algorithm mismatch in user auth request"
+                            )
+                        }
+
+                        method = .publicKey(.rsaSHA2(key: publicKey, algorithm: rsaAlgorithm, signature: signature))
+                    } else {
+                        method = .publicKey(.rsaSHA2(key: publicKey, algorithm: rsaAlgorithm, signature: nil))
+                    }
+                } else if NIOSSHPublicKey.knownAlgorithms.contains(where: {
+                    $0.elementsEqual(algorithmName.readableBytesView)
+                }) {
                     // This is a known algorithm, we can load the key.
                     guard let publicKey = try keyBytes.readSSHHostKey() else {
                         return nil
@@ -1374,6 +1408,20 @@ extension ByteBuffer {
             writtenBytes += self.writeSSHString("publickey".utf8)
             writtenBytes += self.writeSSHBoolean(signature != nil)
             writtenBytes += self.writeSSHString(key.keyPrefix)
+            writtenBytes += self.writeCompositeSSHString { buffer in
+                buffer.writeSSHHostKey(key)
+            }
+
+            if let signature = signature {
+                writtenBytes += self.writeCompositeSSHString { buffer in
+                    buffer.writeSSHSignature(signature)
+                }
+            }
+
+        case .publicKey(.rsaSHA2(key: let key, algorithm: let algorithm, signature: let signature)):
+            writtenBytes += self.writeSSHString("publickey".utf8)
+            writtenBytes += self.writeSSHBoolean(signature != nil)
+            writtenBytes += self.writeSSHString(algorithm.wireName)
             writtenBytes += self.writeCompositeSSHString { buffer in
                 buffer.writeSSHHostKey(key)
             }

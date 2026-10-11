@@ -16,6 +16,7 @@
 import Foundation
 import NIOCore
 import NIOFoundationCompat
+import _CryptoExtras
 
 /// A representation of an SSH signature.
 ///
@@ -41,6 +42,9 @@ extension NIOSSHSignature {
         case ecdsaP384(P384.Signing.ECDSASignature)
 
         case ecdsaP521(P521.Signing.ECDSASignature)
+
+        // RFC 8332 RSA signature. The algorithm is part of the signature blob, so it is kept with the bytes.
+        case rsa(NIOSSHPrivateKey.RSASignatureAlgorithm, _RSA.Signing.RSASignature)
 
         internal enum RawBytes {
             case byteBuffer(ByteBuffer)
@@ -93,10 +97,13 @@ extension NIOSSHSignature.BackingSignature: Equatable {
             return lhs.rawRepresentation == rhs.rawRepresentation
         case (.ecdsaP521(let lhs), .ecdsaP521(let rhs)):
             return lhs.rawRepresentation == rhs.rawRepresentation
+        case (.rsa(let lhsAlgorithm, let lhs), .rsa(let rhsAlgorithm, let rhs)):
+            return lhsAlgorithm == rhsAlgorithm && lhs.rawRepresentation == rhs.rawRepresentation
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _):
+            (.ecdsaP521, _),
+            (.rsa, _):
             return false
         }
     }
@@ -117,6 +124,10 @@ extension NIOSSHSignature.BackingSignature: Hashable {
         case .ecdsaP521(let sig):
             hasher.combine(3)
             hasher.combine(sig.rawRepresentation)
+        case .rsa(let algorithm, let sig):
+            hasher.combine(4)
+            hasher.combine(algorithm)
+            hasher.combine(sig.rawRepresentation)
         }
     }
 }
@@ -134,6 +145,11 @@ extension ByteBuffer {
             return self.writeECDSAP384Signature(baseSignature: sig)
         case .ecdsaP521(let sig):
             return self.writeECDSAP521Signature(baseSignature: sig)
+        case .rsa(let algorithm, let sig):
+            // RFC 8332 § 3: the algorithm name followed by the raw RSASSA-PKCS1-v1_5 signature as a string.
+            var writtenLength = self.writeSSHString(algorithm.wireName)
+            writtenLength += self.writeSSHString(sig.rawRepresentation)
+            return writtenLength
         }
     }
 
@@ -229,6 +245,8 @@ extension ByteBuffer {
                 return try buffer.readECDSAP384Signature()
             } else if bytesView.elementsEqual(NIOSSHSignature.ecdsaP521SignaturePrefix) {
                 return try buffer.readECDSAP521Signature()
+            } else if let algorithm = NIOSSHPrivateKey.RSASignatureAlgorithm(wireName: bytesView) {
+                return try buffer.readRSASignature(algorithm: algorithm)
             } else {
                 // We don't know this signature type.
                 let signature =
@@ -313,6 +331,26 @@ extension ByteBuffer {
         return try NIOSSHSignature(
             backingSignature: .ecdsaP521(ECDSASignatureHelper.toECDSASignature(r: rBytes, s: sBytes))
         )
+    }
+}
+
+extension ByteBuffer {
+    /// A helper function that reads an RSA signature. SHA-1 `ssh-rsa` signatures never reach this function.
+    ///
+    /// Not safe to call from arbitrary code as this does not return the reader index on failure: it relies on the caller performing
+    /// the rewind.
+    fileprivate mutating func readRSASignature(
+        algorithm: NIOSSHPrivateKey.RSASignatureAlgorithm
+    ) throws -> NIOSSHSignature? {
+        guard let signatureBytes = self.readSSHString() else {
+            return nil
+        }
+        guard signatureBytes.readableBytes > 0, signatureBytes.readableBytes <= RSAKeyLimits.maximumModulusBytes else {
+            throw NIOSSHError.invalidSSHMessage(reason: "RSA signature length out of range")
+        }
+
+        let signature = _RSA.Signing.RSASignature(rawRepresentation: signatureBytes.readableBytesView)
+        return NIOSSHSignature(backingSignature: .rsa(algorithm, signature))
     }
 }
 

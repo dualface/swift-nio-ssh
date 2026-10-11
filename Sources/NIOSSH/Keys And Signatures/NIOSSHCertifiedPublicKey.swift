@@ -359,6 +359,8 @@ extension NIOSSHCertifiedPublicKey {
             return Self.p384KeyPrefix
         case .ecdsaP521:
             return Self.p521KeyPrefix
+        case .rsa:
+            preconditionFailure("RSA keys cannot be certified")
         case .certified:
             preconditionFailure("base key cannot be certified")
         }
@@ -474,6 +476,9 @@ extension NIOSSHCertifiedPublicKey {
                 if case .certified = newValue.backingKey {
                     preconditionFailure("Certificate may not use certified key as public key")
                 }
+                if case .rsa = newValue.backingKey {
+                    preconditionFailure("RSA certificates are not supported")
+                }
             }
         }
 
@@ -514,6 +519,10 @@ extension NIOSSHCertifiedPublicKey {
             }
             if case .certified = signatureKey.backingKey {
                 throw NIOSSHError.invalidCertificate(diagnostics: "Certificate may not be signed by certified key")
+            }
+            // RSA keys are supported for plain user authentication only; `keyPrefix` has no RSA certificate form.
+            if case .rsa = key.backingKey {
+                throw NIOSSHError.invalidCertificate(diagnostics: "RSA certificates are not supported")
             }
 
             self.nonce = nonce

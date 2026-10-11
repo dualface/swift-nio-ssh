@@ -161,6 +161,11 @@ extension NIOSSHError {
     internal static func invalidCertificate(diagnostics: String) -> NIOSSHError {
         NIOSSHError(type: .invalidCertificate, diagnostics: diagnostics)
     }
+
+    @inline(never)
+    internal static func unsupportedKeyUsage(reason: String) -> NIOSSHError {
+        NIOSSHError(type: .unsupportedKeyUsage, diagnostics: reason)
+    }
 }
 
 // MARK: - NIOSSHError CustomStringConvertible conformance.
@@ -207,6 +212,7 @@ extension NIOSSHError {
             case invalidHostKeyForKeyExchange
             case invalidOpenSSHPublicKey
             case invalidCertificate
+            case unsupportedKeyUsage
         }
 
         private var base: Base
@@ -304,6 +310,9 @@ extension NIOSSHError {
 
         /// A certificate failed validation.
         public static let invalidCertificate: ErrorType = .init(.invalidCertificate)
+
+        /// A key was used for an operation its algorithm does not support, such as an RSA host key.
+        public static let unsupportedKeyUsage: ErrorType = .init(.unsupportedKeyUsage)
     }
 }
 

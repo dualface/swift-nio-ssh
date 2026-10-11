@@ -16,6 +16,7 @@
 import Foundation
 import NIOCore
 import NIOFoundationCompat
+import _CryptoExtras
 
 /// An SSH public key.
 ///
@@ -96,6 +97,9 @@ extension NIOSSHPublicKey {
             }
         case (.certified(let key), _):
             return key.isValidSignature(signature, for: digest)
+        case (.rsa, _):
+            // RSA host keys are not supported, so an RSA exchange hash signature never verifies.
+            return false
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
@@ -118,6 +122,9 @@ extension NIOSSHPublicKey {
             return key.isValidSignature(sig, for: bytes.readableBytesView)
         case (.certified(let key), _):
             return key.isValidSignature(signature, for: bytes)
+        case (.rsa, _):
+            // This path verifies certificate signatures; RSA certificate authorities are not supported.
+            return false
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
@@ -138,12 +145,25 @@ extension NIOSSHPublicKey {
             return key.isValidSignature(sig, for: payload.bytes.readableBytesView)
         case (.ecdsaP521(let key), .ecdsaP521(let sig)):
             return key.isValidSignature(sig, for: payload.bytes.readableBytesView)
+        case (.rsa(let key), .rsa(let algorithm, let sig)):
+            // The signature must use the algorithm named in the request, which is also the one in the payload.
+            guard algorithm == payload.rsaSignatureAlgorithm else {
+                return false
+            }
+            let bytes = payload.bytes.readableBytesView
+            switch algorithm.base {
+            case .sha256:
+                return key.isValidSignature(sig, for: SHA256.hash(data: bytes), padding: .insecurePKCS1v1_5)
+            case .sha512:
+                return key.isValidSignature(sig, for: SHA512.hash(data: bytes), padding: .insecurePKCS1v1_5)
+            }
         case (.certified(let key), _):
             return key.isValidSignature(signature, for: payload)
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _):
+            (.ecdsaP521, _),
+            (.rsa, _):
             return false
         }
     }
@@ -157,6 +177,7 @@ extension NIOSSHPublicKey {
         case ecdsaP256(P256.Signing.PublicKey)
         case ecdsaP384(P384.Signing.PublicKey)
         case ecdsaP521(P521.Signing.PublicKey)
+        case rsa(_RSA.Signing.PublicKey)
         case certified(NIOSSHCertifiedPublicKey)  // This case recursively contains `NIOSSHPublicKey`.
     }
 
@@ -172,6 +193,9 @@ extension NIOSSHPublicKey {
     /// The prefix of a P521 ECDSA public key.
     internal static let ecdsaP521PublicKeyPrefix = "ecdsa-sha2-nistp521".utf8
 
+    /// The prefix of an RSA public key. RFC 8332 keeps this format for the SHA-2 signature algorithms.
+    internal static let rsaPublicKeyPrefix = "ssh-rsa".utf8
+
     internal var keyPrefix: String.UTF8View {
         switch self.backingKey {
         case .ed25519:
@@ -182,6 +206,8 @@ extension NIOSSHPublicKey {
             return Self.ecdsaP384PublicKeyPrefix
         case .ecdsaP521:
             return Self.ecdsaP521PublicKeyPrefix
+        case .rsa:
+            return Self.rsaPublicKeyPrefix
         case .certified(let base):
             return base.keyPrefix
         }
@@ -207,12 +233,15 @@ extension NIOSSHPublicKey.BackingKey: Equatable {
             return lhs.rawRepresentation == rhs.rawRepresentation
         case (.ecdsaP521(let lhs), .ecdsaP521(let rhs)):
             return lhs.rawRepresentation == rhs.rawRepresentation
+        case (.rsa(let lhs), .rsa(let rhs)):
+            return lhs.pkcs1DERRepresentation == rhs.pkcs1DERRepresentation
         case (.certified(let lhs), .certified(let rhs)):
             return lhs == rhs
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
             (.ecdsaP521, _),
+            (.rsa, _),
             (.certified, _):
             return false
         }
@@ -237,6 +266,9 @@ extension NIOSSHPublicKey.BackingKey: Hashable {
         case .certified(let pkey):
             hasher.combine(5)
             hasher.combine(pkey)
+        case .rsa(let pkey):
+            hasher.combine(6)
+            hasher.combine(pkey.pkcs1DERRepresentation)
         }
     }
 }
@@ -260,6 +292,9 @@ extension ByteBuffer {
         case .ecdsaP521(let key):
             writtenBytes += self.writeSSHString(NIOSSHPublicKey.ecdsaP521PublicKeyPrefix)
             writtenBytes += self.writeECDSAP521PublicKey(baseKey: key)
+        case .rsa(let key):
+            writtenBytes += self.writeSSHString(NIOSSHPublicKey.rsaPublicKeyPrefix)
+            writtenBytes += self.writeRSAPublicKey(baseKey: key)
         case .certified(let key):
             return self.writeCertifiedKey(key)
         }
@@ -281,6 +316,8 @@ extension ByteBuffer {
             return self.writeECDSAP384PublicKey(baseKey: key)
         case .ecdsaP521(let key):
             return self.writeECDSAP521PublicKey(baseKey: key)
+        case .rsa(let key):
+            return self.writeRSAPublicKey(baseKey: key)
         case .certified:
             preconditionFailure("Certified keys are the only callers of this method, and cannot contain themselves")
         }
@@ -310,6 +347,8 @@ extension ByteBuffer {
                 return try buffer.readECDSAP384PublicKey()
             } else if keyIdentifierBytes.elementsEqual(NIOSSHPublicKey.ecdsaP521PublicKeyPrefix) {
                 return try buffer.readECDSAP521PublicKey()
+            } else if keyIdentifierBytes.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
+                return try buffer.readRSAPublicKey()
             } else {
                 // We don't know this public key type. Maybe the certified keys do.
                 return try buffer.readCertifiedKeyWithoutKeyPrefix(keyIdentifierBytes).map(NIOSSHPublicKey.init)
@@ -346,6 +385,21 @@ extension ByteBuffer {
         var writtenBytes = 0
         writtenBytes += self.writeSSHString("nistp521".utf8)
         writtenBytes += self.writeSSHString(baseKey.x963Representation)
+        return writtenBytes
+    }
+
+    private mutating func writeRSAPublicKey(baseKey: _RSA.Signing.PublicKey) -> Int {
+        // For ssh-rsa, the key format is `mpint e` followed by `mpint n` (RFC 4253 § 6.6).
+        let primitives: _RSA.Signing.PublicKey.Primitives
+        do {
+            primitives = try baseKey.getKeyPrimitives()
+        } catch {
+            preconditionFailure("A constructed RSA public key always has primitives: \(error)")
+        }
+
+        var writtenBytes = 0
+        writtenBytes += self.writePositiveMPInt(primitives.publicExponent)
+        writtenBytes += self.writePositiveMPInt(primitives.modulus)
         return writtenBytes
     }
 
@@ -433,6 +487,25 @@ extension ByteBuffer {
 
         let key = try P521.Signing.PublicKey(x963Representation: qBytes.readableBytesView)
         return NIOSSHPublicKey(backingKey: .ecdsaP521(key))
+    }
+
+    /// A helper function that reads an RSA public key.
+    ///
+    /// Not safe to call from arbitrary code as this does not return the reader index on failure: it relies on the caller performing
+    /// the rewind.
+    private mutating func readRSAPublicKey() throws -> NIOSSHPublicKey? {
+        // For ssh-rsa, the key format is `mpint e` followed by `mpint n`. Both are attacker controlled, so they are
+        // bounded before any big number arithmetic happens.
+        guard
+            let exponent = try self.readRSAPositiveMPInt(maximumBytes: RSAKeyLimits.maximumPublicExponentBytes),
+            let modulus = try self.readRSAPositiveMPInt(maximumBytes: RSAKeyLimits.maximumModulusBytes)
+        else {
+            return nil
+        }
+
+        try RSAKeyLimits.validate(modulus: modulus, publicExponent: exponent)
+        let key = try _RSA.Signing.PublicKey(n: Array(modulus), e: Array(exponent))
+        return NIOSSHPublicKey(backingKey: .rsa(key))
     }
 
     /// A helper function for complex readers that will reset a buffer on nil or on error, as though the read

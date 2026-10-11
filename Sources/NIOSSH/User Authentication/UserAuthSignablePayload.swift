@@ -32,7 +32,27 @@ import NIOCore
 internal struct UserAuthSignablePayload {
     private(set) var bytes: ByteBuffer
 
-    init(sessionIdentifier: ByteBuffer, userName: String, serviceName: String, publicKey: NIOSSHPublicKey) {
+    /// The RFC 8332 algorithm named in the payload. Set exactly when the key is an RSA key.
+    let rsaSignatureAlgorithm: NIOSSHPrivateKey.RSASignatureAlgorithm?
+
+    init(
+        sessionIdentifier: ByteBuffer,
+        userName: String,
+        serviceName: String,
+        publicKey: NIOSSHPublicKey,
+        rsaSignatureAlgorithm: NIOSSHPrivateKey.RSASignatureAlgorithm? = nil
+    ) {
+        // For RSA keys the algorithm name differs from the key format name, and the bare key format name would
+        // mean SHA-1. Requiring the algorithm keeps that name out of every signed payload.
+        let isRSAKey: Bool
+        if case .rsa = publicKey.backingKey {
+            isRSAKey = true
+        } else {
+            isRSAKey = false
+        }
+        precondition(isRSAKey == (rsaSignatureAlgorithm != nil), "RSA payloads need exactly one RSA algorithm")
+        self.rsaSignatureAlgorithm = rsaSignatureAlgorithm
+
         // We use the session identifier as the base buffer and just append to it. We ask for 1kB because it's likely
         // enough for this data.
         var sessionIdentifier = sessionIdentifier
@@ -45,7 +65,7 @@ internal struct UserAuthSignablePayload {
         newBuffer.writeSSHString(serviceName.utf8)
         newBuffer.writeSSHString("publickey".utf8)
         newBuffer.writeSSHBoolean(true)
-        newBuffer.writeSSHString(publicKey.keyPrefix)
+        newBuffer.writeSSHString(rsaSignatureAlgorithm?.wireName ?? publicKey.keyPrefix)
         newBuffer.writeCompositeSSHString { buffer in
             buffer.writeSSHHostKey(publicKey)
         }

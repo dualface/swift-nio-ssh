@@ -14,6 +14,7 @@
 
 @preconcurrency import Crypto
 import NIOCore
+import _CryptoExtras
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -52,6 +53,20 @@ public struct NIOSSHPrivateKey: Sendable {
         self.backingKey = .ecdsaP521(key)
     }
 
+    /// Create a private key from an RSA key, for client user authentication only.
+    ///
+    /// RSA keys use the `ssh-rsa` public key format and sign with the RFC 8332 algorithm in `signatureAlgorithm`.
+    /// A server that accepts only the other SHA-2 algorithm rejects the attempt, so a client that does not know the
+    /// server's preference can offer the key again with the other algorithm. RSA keys cannot be used as host keys
+    /// or with certificates.
+    ///
+    /// - Throws: ``NIOSSHError/ErrorType-swift.struct/invalidKeySize`` when the modulus is outside 2048...8192 bits,
+    ///   or ``NIOSSHError/ErrorType-swift.struct/invalidSSHMessage`` when the public exponent is out of range.
+    public init(rsaKey key: _RSA.Signing.PrivateKey, signatureAlgorithm: RSASignatureAlgorithm) throws {
+        try RSAKeyLimits.validate(key.publicKey)
+        self.backingKey = .rsa(key, signatureAlgorithm)
+    }
+
     #if canImport(Darwin)
     public init(secureEnclaveP256Key key: SecureEnclave.P256.Signing.PrivateKey) {
         self.backingKey = .secureEnclaveP256(key)
@@ -69,6 +84,9 @@ public struct NIOSSHPrivateKey: Sendable {
             return ["ecdsa-sha2-nistp384"]
         case .ecdsaP521:
             return ["ecdsa-sha2-nistp521"]
+        case .rsa:
+            // RSA keys are supported for user authentication only, never as host keys.
+            return []
         #if canImport(Darwin)
         case .secureEnclaveP256:
             return ["ecdsa-sha2-nistp256"]
@@ -84,6 +102,7 @@ extension NIOSSHPrivateKey {
         case ecdsaP256(P256.Signing.PrivateKey)
         case ecdsaP384(P384.Signing.PrivateKey)
         case ecdsaP521(P521.Signing.PrivateKey)
+        case rsa(_RSA.Signing.PrivateKey, RSASignatureAlgorithm)
 
         #if canImport(Darwin)
         case secureEnclaveP256(SecureEnclave.P256.Signing.PrivateKey)
@@ -114,6 +133,9 @@ extension NIOSSHPrivateKey {
                 try key.signature(for: ptr)
             }
             return NIOSSHSignature(backingSignature: .ecdsaP521(signature))
+        case .rsa:
+            // Exchange hash signing is a host key operation; RSA keys never advertise a host key algorithm.
+            throw NIOSSHError.unsupportedKeyUsage(reason: "RSA keys cannot be used as host keys")
 
         #if canImport(Darwin)
         case .secureEnclaveP256(let key):
@@ -139,6 +161,16 @@ extension NIOSSHPrivateKey {
         case .ecdsaP521(let key):
             let signature = try key.signature(for: payload.bytes.readableBytesView)
             return NIOSSHSignature(backingSignature: .ecdsaP521(signature))
+        case .rsa(let key, let algorithm):
+            let bytes = payload.bytes.readableBytesView
+            let signature: _RSA.Signing.RSASignature
+            switch algorithm.base {
+            case .sha256:
+                signature = try key.signature(for: SHA256.hash(data: bytes), padding: .insecurePKCS1v1_5)
+            case .sha512:
+                signature = try key.signature(for: SHA512.hash(data: bytes), padding: .insecurePKCS1v1_5)
+            }
+            return NIOSSHSignature(backingSignature: .rsa(algorithm, signature))
         #if canImport(Darwin)
         case .secureEnclaveP256(let key):
             let signature = try key.signature(for: payload.bytes.readableBytesView)
@@ -160,10 +192,23 @@ extension NIOSSHPrivateKey {
             return NIOSSHPublicKey(backingKey: .ecdsaP384(privateKey.publicKey))
         case .ecdsaP521(let privateKey):
             return NIOSSHPublicKey(backingKey: .ecdsaP521(privateKey.publicKey))
+        case .rsa(let privateKey, _):
+            return NIOSSHPublicKey(backingKey: .rsa(privateKey.publicKey))
         #if canImport(Darwin)
         case .secureEnclaveP256(let privateKey):
             return NIOSSHPublicKey(backingKey: .ecdsaP256(privateKey.publicKey))
         #endif
         }
+    }
+}
+
+extension NIOSSHPrivateKey {
+    /// The RFC 8332 algorithm this key signs user auth requests with, or `nil` for key types whose signature
+    /// algorithm is fixed by the key type.
+    internal var rsaSignatureAlgorithm: RSASignatureAlgorithm? {
+        if case .rsa(_, let algorithm) = self.backingKey {
+            return algorithm
+        }
+        return nil
     }
 }

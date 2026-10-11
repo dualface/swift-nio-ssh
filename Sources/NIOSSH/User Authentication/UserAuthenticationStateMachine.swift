@@ -534,6 +534,41 @@ extension UserAuthenticationStateMachine {
             // For now we do a shortcut: we just say that all keys are acceptable, rather than ask the delegate.
             return self.loop.makeSucceededFuture(.publicKeyOK(.init(key: key)))
 
+        case .publicKey(.rsaSHA2(key: let key, algorithm: let algorithm, signature: .some(let signature))):
+            let dataToSign = UserAuthSignablePayload(
+                sessionIdentifier: sessionID,
+                userName: request.username,
+                serviceName: request.service,
+                publicKey: key,
+                rsaSignatureAlgorithm: algorithm
+            )
+            let supportedMethods = delegate.supportedAuthenticationMethods
+
+            guard key.isValidSignature(signature, for: dataToSign) else {
+                return self.loop.makeSucceededFuture(
+                    .failure(.init(authentications: supportedMethods.strings, partialSuccess: false))
+                )
+            }
+
+            let request = NIOSSHUserAuthenticationRequest(
+                username: request.username,
+                serviceName: request.service,
+                request: .publicKey(.init(publicKey: key))
+            )
+            let promise = self.loop.makePromise(of: NIOSSHUserAuthenticationOutcome.self)
+            delegate.requestReceived(request: request, responsePromise: promise)
+
+            return promise.futureResult.map { outcome in
+                .init(outcome, supportedMethods: supportedMethods)
+            }
+
+        case .publicKey(.rsaSHA2(key: _, algorithm: _, signature: .none)):
+            // RSA key queries are not answered: the PK_OK reply would have to echo the SHA-2 algorithm name, which
+            // this implementation does not model. Clients must send signed requests, as NIOSSH clients always do.
+            return self.loop.makeSucceededFuture(
+                .failure(.init(authentications: delegate.supportedAuthenticationMethods.strings, partialSuccess: false))
+            )
+
         case .publicKey(.unknown):
             // We don't known the algorithm, the auth attempt has failed.
             return self.loop.makeSucceededFuture(

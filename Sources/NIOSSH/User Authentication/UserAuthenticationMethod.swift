@@ -242,6 +242,25 @@ extension SSHMessage.UserAuthRequestMessage {
 
         switch request.offer {
         case .privateKey(let privateKeyRequest):
+            if let rsaAlgorithm = privateKeyRequest.privateKey.rsaSignatureAlgorithm {
+                // RFC 8332: the blob stays ssh-rsa, while the request and signature name the SHA-2 algorithm.
+                guard case .rsa = privateKeyRequest.publicKey.backingKey else {
+                    throw NIOSSHError.unsupportedKeyUsage(reason: "RSA keys cannot be used with certificates")
+                }
+                let dataToSign = UserAuthSignablePayload(
+                    sessionIdentifier: sessionID,
+                    userName: self.username,
+                    serviceName: self.service,
+                    publicKey: privateKeyRequest.publicKey,
+                    rsaSignatureAlgorithm: rsaAlgorithm
+                )
+                let signature = try privateKeyRequest.privateKey.sign(dataToSign)
+                self.method = .publicKey(
+                    .rsaSHA2(key: privateKeyRequest.publicKey, algorithm: rsaAlgorithm, signature: signature)
+                )
+                return
+            }
+
             let dataToSign = UserAuthSignablePayload(
                 sessionIdentifier: sessionID,
                 userName: self.username,
